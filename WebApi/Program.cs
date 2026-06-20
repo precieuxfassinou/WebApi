@@ -1,23 +1,125 @@
-var builder = WebApplication.CreateBuilder(args);
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi.Models;
+using Serilog;
+using Serilog.Formatting.Compact;
+using System.Text;
+using WebApi.Infrastructure;
+using WebApi.Services;
 
-// Add services to the container.
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .WriteTo.Console()
+    .CreateBootstrapLogger();
 
-builder.Services.AddControllers();
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
-builder.Services.AddOpenApi();
-
-var app = builder.Build();
-
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
+try
 {
-    app.MapOpenApi();
+    var builder = WebApplication.CreateBuilder(args);
+
+    // ── Serilog ───────────────────────────────────────────────────────────── 
+    builder.Host.UseSerilog((ctx, services, lc) => lc
+        .ReadFrom.Configuration(ctx.Configuration)
+        .ReadFrom.Services(services)
+        .Enrich.FromLogContext()
+        .WriteTo.Console(new RenderedCompactJsonFormatter())
+        .WriteTo.File("logs/app-.log",
+            rollingInterval: RollingInterval.Day,
+            retainedFileCountLimit: 30));
+
+    // ── PostgreSQL + EF Core ───────────────────────────────────────────────── 
+    builder.Services.AddDbContext<AppDbContext>(opt =>
+        opt.UseNpgsql(builder.Configuration.GetConnectionString("Default")));
+
+    // ── JWT Authentication ─────────────────────────────────────────────────── 
+    var jwtSection = builder.Configuration.GetSection("Jwt");
+    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(opt =>
+        {
+        opt.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = jwtSection["Issuer"],
+            ValidAudience = jwtSection["Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(
+                    Encoding.UTF8.GetBytes(jwtSection["Key"]!)),
+            ClockSkew = TimeSpan.FromSeconds(30)
+        };
+        });
+
+    builder.Services.AddAuthorization();
+    builder.Services.AddScoped<ITokenService, TokenService>();
+    builder.Services.AddControllers();
+
+    // ── CORS pour Angular dev ──────────────────────────────────────────────── 
+    builder.Services.AddCors(o => o.AddPolicy("AllowAngular", p =>
+        p.WithOrigins("http://localhost:4200")
+         .AllowAnyHeader()
+         .AllowAnyMethod()));
+
+    // ── Swagger avec Bearer ────────────────────────────────────────────────── 
+    builder.Services.AddEndpointsApiExplorer();
+    builder.Services.AddSwaggerGen(c =>
+    {
+        c.SwaggerDoc("v1", new OpenApiInfo
+        {
+            Title = "UserMgmt API",
+            Version = "v1"
+        });
+
+        c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+        {
+            Name = "Authorization",
+            Type = SecuritySchemeType.Http,
+            Scheme = "bearer",
+            BearerFormat = "JWT",
+            In = ParameterLocation.Header,
+            Description = "Entre ton token JWT ici"
+        });
+
+        c.AddSecurityRequirement(new OpenApiSecurityRequirement
+{
+    {
+        new OpenApiSecurityScheme
+        {
+            Reference = new OpenApiReference
+            {
+                Type = ReferenceType.SecurityScheme,
+                Id = "Bearer"
+            }
+        },
+        Array.Empty<string>()
+    }
+        });
+    });
+
+    var app = builder.Build();
+
+    // ── Auto-migration au démarrage (dev) ───────────────────────────────── 
+    using (var scope = app.Services.CreateScope())
+
+        scope.ServiceProvider.GetRequiredService<AppDbContext>().Database.Migrate();
+
+    app.UseSerilogRequestLogging(opts =>
+        opts.MessageTemplate = "HTTP {RequestMethod} {RequestPath} → { StatusCode} ({ Elapsed: 0.0} ms)"); 
+
+
+    if (app.Environment.IsDevelopment())
+    {
+        app.UseSwagger(); app.UseSwaggerUI();
+    }
+
+    app.UseHttpsRedirection();
+    app.UseCors("AllowAngular");
+    app.UseAuthentication();
+    app.UseAuthorization();
+    app.MapControllers();
+    app.Run();
 }
-
-app.UseHttpsRedirection();
-
-app.UseAuthorization();
-
-app.MapControllers();
-
-app.Run();
+catch (Exception ex)
+{
+    Log.Fatal(ex, "Application terminée de façon inattendue"); } 
+finally { Log.CloseAndFlush(); }
